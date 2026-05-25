@@ -2,6 +2,8 @@ const { PrismaClient } = require('@prisma/client')
 const { createCode, listCodes, revokeCode } = require('../services/codeService')
 
 const prisma = new PrismaClient()
+const kickedUsers = new Set()
+exports.kickedUsers = kickedUsers
 
 exports.getMetrics = async (req, res) => {
   try {
@@ -60,10 +62,10 @@ exports.revokeCode = async (req, res) => {
 }
 
 exports.getLogs = async (req, res) => {
-  const page   = Math.max(1, parseInt(req.query.page) || 1)
-  const limit  = Math.min(100, parseInt(req.query.limit) || 50)
-  const skip   = (page - 1) * limit
-  const where  = {}
+  const page  = Math.max(1, parseInt(req.query.page) || 1)
+  const limit = Math.min(100, parseInt(req.query.limit) || 50)
+  const skip  = (page - 1) * limit
+  const where = {}
   if (req.query.status) where.status = req.query.status
   if (req.query.search) where.OR = [{ ip: { contains: req.query.search } }, { username: { contains: req.query.search } }]
   try {
@@ -79,18 +81,61 @@ exports.getLogs = async (req, res) => {
 
 exports.getUsers = async (req, res) => {
   try {
-    const users = await prisma.user.findMany({ select: { id: true, username: true, isAdmin: true, createdAt: true }, orderBy: { createdAt: 'desc' } })
+    const users = await prisma.user.findMany({
+      select: { id: true, username: true, isAdmin: true, banned: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+    })
     res.json({ users })
   } catch {
     res.status(500).json({ error: 'Erro ao buscar usuários' })
   }
 }
 
-exports.promoteUser = async (req, res) => {
+exports.banUser = async (req, res) => {
   try {
-    const user = await prisma.user.update({ where: { id: req.params.id }, data: { isAdmin: true }, select: { id: true, username: true, isAdmin: true } })
-    res.json({ message: 'Usuário promovido a admin', user })
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data:  { banned: true },
+      select: { id: true, username: true, banned: true },
+    })
+    kickedUsers.add(user.id)
+    res.json({ message: `Usuário ${user.username} banido`, user })
   } catch {
     res.status(404).json({ error: 'Usuário não encontrado' })
+  }
+}
+
+exports.unbanUser = async (req, res) => {
+  try {
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data:  { banned: false },
+      select: { id: true, username: true, banned: true },
+    })
+    kickedUsers.delete(user.id)
+    res.json({ message: `Usuário ${user.username} desbanido`, user })
+  } catch {
+    res.status(404).json({ error: 'Usuário não encontrado' })
+  }
+}
+
+exports.kickUser = async (req, res) => {
+  kickedUsers.add(req.params.id)
+  setTimeout(() => kickedUsers.delete(req.params.id), 60 * 60 * 1000)
+  res.json({ message: 'Sessão do usuário encerrada' })
+}
+
+exports.getConversations = async (req, res) => {
+  try {
+    const { userId } = req.params
+    const conversations = await prisma.conversation.findMany({
+      where:   { userId },
+      orderBy: { updatedAt: 'desc' },
+      take:    50,
+      select:  { id: true, title: true, createdAt: true, updatedAt: true },
+    })
+    res.json({ conversations })
+  } catch {
+    res.status(500).json({ error: 'Erro ao buscar conversas' })
   }
 }

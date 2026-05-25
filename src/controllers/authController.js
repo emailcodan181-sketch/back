@@ -74,7 +74,11 @@ exports.login = async (req, res) => {
 
   try {
     const user = await prisma.user.findUnique({ where: { username } })
-
+    
+  if (user && user.banned) {
+  await writeLoginLog({ userId: user.id, username, ip, userAgent, status: 'FAILURE', reason: 'BANNED' })
+  return res.status(403).json({ error: 'Conta suspensa. Entre em contato com o administrador.' })
+}
     if (!user) {
       await writeLoginLog({ username, ip, userAgent, status: 'FAILURE', reason: 'USER_NOT_FOUND' })
       return res.status(401).json({ error: 'Credenciais inválidas' })
