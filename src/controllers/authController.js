@@ -1,150 +1,157 @@
 /**
- * VALVET — Controller: Autenticação
+ * VALVET — Service: Proxy de IA com suporte a SSE
  */
 
-const bcrypt  = require('bcrypt')
-const jwt     = require('jsonwebtoken')
-const { PrismaClient } = require('@prisma/client')
-const { validationResult } = require('express-validator')
-const { writeLoginLog }    = require('../services/logService')
-const { validateCode }     = require('../services/codeService')
+const JAILBREAK_PATTERNS = [
+  /ignore (all |previous |prior )?instructions/i,
+  /pretend (you are|to be|you're)/i,
+  /you are now/i,
+  /act as (if you are|a )?/i,
+  /DAN mode/i,
+  /jailbreak/i,
+  /bypass (your |all )?restrictions/i,
+  /forget (your |all )?instructions/i,
+]
 
-const prisma = new PrismaClient()
-
-// Armazenamento simples de refresh tokens (produção: usar Redis)
-const refreshTokenStore = new Set()
-
-function issueTokens(userId, username) {
-  const accessToken = jwt.sign(
-    { userId, username },
-    process.env.JWT_SECRET,
-    { expiresIn: '15m' }
-  )
-  const refreshToken = jwt.sign(
-    { userId, username },
-    process.env.JWT_REFRESH_SECRET,
-    { expiresIn: '7d' }
-  )
-  return { accessToken, refreshToken }
+function detectJailbreak(text) {
+  return JAILBREAK_PATTERNS.some(pattern => pattern.test(text))
 }
 
-function setRefreshCookie(res, token) {
-  res.cookie('refreshToken', token, {
-    httpOnly: true,
-    secure:   process.env.COOKIE_SECURE === 'true',
-    sameSite: process.env.COOKIE_SAMESITE || 'strict',
-    maxAge:   7 * 24 * 60 * 60 * 1000,
-  })
+function buildSystemPrompt(username) {
+  const now = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
+  return `Você é VALVET, uma inteligência artificial avançada e versátil.
+
+Data e hora atual: ${now}
+Usuário: ${username}
+
+Diretrizes:
+- Use o nome "${username}" naturalmente na conversa quando fizer sentido
+- Responda sempre em português, adaptando ao idioma do usuário se ele mudar
+- Dê respostas COMPLETAS e DETALHADAS — nunca trunce ou resuma desnecessariamente
+- Use formatação markdown: listas, negrito, blocos de código, títulos
+- Em código, sempre explique o que faz e por quê
+- Seja direto, inteligente e amigável — como um amigo muito bem informado
+- Você tem conhecimento atualizado e sabe que o ano atual é ${new Date().getFullYear()}
+- Nunca diga que seu conhecimento vai só até 2022 ou 2023 — use a data atual fornecida acima
+- Tenha personalidade: seja confiante, curioso e engajado
+- Faça perguntas de acompanhamento quando ajudar a entender melhor o que o usuário precisa`
 }
 
-// ── Register ──────────────────────────────────────────────────────
-exports.register = async (req, res) => {
-  const errors = validationResult(req)
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() })
-  }
-
-  const { username, password, accessCode } = req.body
-
-  try {
-    // Validar código de acesso
-    const { valid, reason, record } = await validateCode(accessCode)
-    if (!valid) return res.status(400).json({ error: reason })
-
-    // Verificar username duplicado
-    const existing = await prisma.user.findUnique({ where: { username } })
-    if (existing) return res.status(400).json({ error: 'Username já em uso' })
-
-    // Criar usuário
-    const passwordHash = await bcrypt.hash(password, 12)
-    await prisma.user.create({ data: { username, passwordHash } })
-
-    // Marcar código como usado
-    await prisma.accessCode.update({
-      where: { id: record.id },
-      data:  { usedAt: new Date() },
-    })
-
-    res.status(201).json({ message: 'Conta criada com sucesso' })
-  } catch (err) {
-    if (process.env.NODE_ENV !== 'production') console.error(err)
-    res.status(500).json({ error: 'Erro interno do servidor' })
-  }
-}
-
-// ── Login ─────────────────────────────────────────────────────────
-exports.login = async (req, res) => {
-  const errors = validationResult(req)
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ error: 'Credenciais inválidas' })
-  }
-
-  const { username, password } = req.body
-  const ip        = req.ip || 'unknown'
-  const userAgent = req.headers['user-agent'] || 'unknown'
-
-  try {
-    const user = await prisma.user.findUnique({ where: { username } })
-
-    if (!user) {
-      await writeLoginLog({ username, ip, userAgent, status: 'FAILURE', reason: 'USER_NOT_FOUND' })
-      return res.status(401).json({ error: 'Credenciais inválidas' })
-    }
-
-    const valid = await bcrypt.compare(password, user.passwordHash)
-    if (!valid) {
-      await writeLoginLog({ userId: user.id, username, ip, userAgent, status: 'FAILURE', reason: 'INVALID_PASSWORD' })
-      return res.status(401).json({ error: 'Credenciais inválidas' })
-    }
-
-    await writeLoginLog({ userId: user.id, username, ip, userAgent, status: 'SUCCESS' })
-
-    const { accessToken, refreshToken } = issueTokens(user.id, user.username)
-    refreshTokenStore.add(refreshToken)
-    setRefreshCookie(res, refreshToken)
-
-    res.json({
-      accessToken,
-      user: { id: user.id, username: user.username, isAdmin: user.isAdmin },
-    })
-  } catch (err) {
-    if (process.env.NODE_ENV !== 'production') console.error(err)
-    res.status(500).json({ error: 'Erro interno do servidor' })
-  }
-}
-
-// ── Refresh ───────────────────────────────────────────────────────
-exports.refresh = async (req, res) => {
-  const token = req.cookies?.refreshToken
-  if (!token) return res.status(401).json({ error: 'Refresh token ausente' })
-
-  try {
-    const payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET)
-
-    // Rotação: invalidar token usado e emitir novo par
-    refreshTokenStore.delete(token)
-
-    const { accessToken, refreshToken: newRefresh } = issueTokens(payload.userId, payload.username)
-    refreshTokenStore.add(newRefresh)
-    setRefreshCookie(res, newRefresh)
-
-    res.json({ accessToken })
-  } catch {
-    res.clearCookie('refreshToken')
-    res.status(401).json({ error: 'Refresh token inválido ou expirado' })
-  }
-}
-
-// ── Logout ────────────────────────────────────────────────────────
-exports.logout = (req, res) => {
-  const token = req.cookies?.refreshToken
-  if (token) refreshTokenStore.delete(token)
-
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    secure:   process.env.COOKIE_SECURE === 'true',
-    sameSite: process.env.COOKIE_SAMESITE || 'strict',
+async function streamAnthropic({ messages, res, username }) {
+  const response = await fetch(`${process.env.AI_BASE_URL}/messages`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         process.env.AI_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model:      process.env.AI_MODEL,
+      max_tokens: 4096,
+      system:     buildSystemPrompt(username),
+      stream:     true,
+      messages:   messages.slice(-20).map(m => ({ role: m.role, content: m.content })),
+    }),
   })
 
-  res.json({ message: 'Logout realizado' })
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.error?.message || `AI API error ${response.status}`)
+  }
+
+  const reader  = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let totalTokens = 0
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop()
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (raw === '[DONE]') continue
+      try {
+        const event = JSON.parse(raw)
+        if (event.type === 'content_block_delta' && event.delta?.text) {
+          res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`)
+        }
+        if (event.type === 'message_delta' && event.usage) {
+          totalTokens = event.usage.output_tokens || 0
+        }
+        if (event.type === 'message_stop') {
+          res.write(`data: ${JSON.stringify({ done: true })}\n\n`)
+        }
+      } catch { }
+    }
+  }
+
+  return totalTokens
 }
+
+async function streamOpenAI({ messages, res, username }) {
+  const response = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.AI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model:      process.env.AI_MODEL,
+      max_tokens: 4096,
+      stream:     true,
+      messages: [
+        { role: 'system', content: buildSystemPrompt(username) },
+        ...messages.slice(-20).map(m => ({ role: m.role, content: m.content })),
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.error?.message || `AI API error ${response.status}`)
+  }
+
+  const reader  = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop()
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (raw === '[DONE]') {
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`)
+        continue
+      }
+      try {
+        const event = JSON.parse(raw)
+        const text  = event.choices?.[0]?.delta?.content
+        if (text) res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`)
+      } catch { }
+    }
+  }
+
+  return 0
+}
+
+async function streamAI({ messages, res, username }) {
+  const isAnthropic = (process.env.AI_BASE_URL || '').includes('anthropic')
+  return isAnthropic
+    ? streamAnthropic({ messages, res, username })
+    : streamOpenAI({ messages, res, username })
+}
+
+module.exports = { streamAI, detectJailbreak }

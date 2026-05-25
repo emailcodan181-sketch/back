@@ -54,7 +54,7 @@ exports.sendMessage = async (req, res) => {
   res.write(`data: ${JSON.stringify({ conversationId: convId })}\n\n`)
 
   try {
-    const tokensUsed = await streamAI({ messages, res })
+    const tokensUsed = await streamAI({ messages, res, username: req.user.username })
     const latencyMs  = Date.now() - start
 
     await writeRequestLog({ userId, conversationId: convId, tokensUsed, latencyMs })
