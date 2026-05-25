@@ -16,3 +16,4 @@ router.get('/users',           adminController.getUsers)
 router.post('/users/:id/ban',  adminController.banUser)
 router.post('/users/:id/unban',adminController.unbanUser)
 router.post('/users/:id/kick', adminController.kickUser)
+module.exports = router
